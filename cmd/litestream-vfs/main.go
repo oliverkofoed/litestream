@@ -25,6 +25,7 @@ import (
 
 	// Import all replica backends to register their URL factories.
 	_ "github.com/benbjohnson/litestream/abs"
+	_ "github.com/benbjohnson/litestream/abssas"
 	_ "github.com/benbjohnson/litestream/file"
 	_ "github.com/benbjohnson/litestream/gs"
 	_ "github.com/benbjohnson/litestream/nats"

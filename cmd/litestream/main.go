@@ -23,6 +23,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
+	"github.com/benbjohnson/litestream/abssas"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/internal"
@@ -920,6 +921,9 @@ type ReplicaSettings struct {
 	AccountName string `yaml:"account-name"`
 	AccountKey  string `yaml:"account-key"`
 
+	// ABSSAS settings (Azure Blob Storage with SAS URL authentication)
+	SASURL string `yaml:"sasurl"`
+
 	// SFTP settings
 	Host             string `yaml:"host"`
 	User             string `yaml:"user"`
@@ -1136,6 +1140,10 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		}
 	case "abs":
 		if r.Client, err = newABSReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
+	case "abssas":
+		if r.Client, err = newABSSASReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	case "sftp":
@@ -1484,6 +1492,11 @@ func newABSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *
 	}
 
 	return client, nil
+}
+
+// newABSSASReplicaClientFromConfig returns a new instance of abssas.ReplicaClient built from config.
+func newABSSASReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *abssas.ReplicaClient, err error) {
+	return abssas.NewReplicaClient(c.SASURL)
 }
 
 // newSFTPReplicaClientFromConfig returns a new instance of sftp.ReplicaClient built from config.
