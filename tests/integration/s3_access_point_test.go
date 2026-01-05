@@ -4,8 +4,10 @@ package integration
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,6 +124,45 @@ func newMinioS3Client(t *testing.T, endpoint string, forcePathStyle bool) *awss3
 	})
 }
 
+func newMinioS3ClientSSL(t *testing.T, endpoint, caCertPath string, forcePathStyle bool) *awss3.Client {
+	t.Helper()
+
+	// Create custom HTTP client with TLS verification disabled (test only)
+	// This matches the skip-verify: true setting used in the Litestream config
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: tlsConfig,
+		},
+	}
+
+	resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{
+			PartitionID:       "aws",
+			URL:               endpoint,
+			SigningRegion:     "us-east-1",
+			HostnameImmutable: true,
+		}, nil
+	})
+
+	cfg, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion("us-east-1"),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("minioadmin", "minioadmin", "")),
+		config.WithEndpointResolverWithOptions(resolver),
+		config.WithHTTPClient(httpClient),
+	)
+	if err != nil {
+		t.Fatalf("load aws config: %v", err)
+	}
+
+	return awss3.NewFromConfig(cfg, func(o *awss3.Options) {
+		o.UsePathStyle = forcePathStyle
+	})
+}
+
 func createBucket(t *testing.T, ctx context.Context, client *awss3.Client, bucket string) {
 	t.Helper()
 
@@ -222,4 +263,87 @@ func findUserTable(db *sql.DB) (string, error) {
 		return "", fmt.Errorf("find table: %w", err)
 	}
 	return name, nil
+}
+
+// TestS3AccessPointLocalStackSSL verifies replication to S3 via MinIO with SSL.
+// Note: Uses regular bucket instead of access point ARN due to MinIO SSL limitations.
+func TestS3AccessPointLocalStackSSL(t *testing.T) {
+	RequireBinaries(t)
+	RequireDocker(t)
+
+	containerName, endpoint, caCertPath := StartMinioTestContainerSSL(t)
+	t.Cleanup(func() {
+		StopMinioTestContainer(t, containerName)
+	})
+
+	ctx := context.Background()
+	// Use path-style for SSL
+	s3Client := newMinioS3ClientSSL(t, endpoint, caCertPath, true)
+
+	bucket := fmt.Sprintf("litestream-ssl-%d", time.Now().UnixNano())
+
+	createBucket(t, ctx, s3Client, bucket)
+	t.Cleanup(func() {
+		if os.Getenv("SOAK_KEEP_TEMP") != "" {
+			t.Logf("SOAK_KEEP_TEMP set, preserving bucket %s", bucket)
+			return
+		}
+		if err := clearBucket(ctx, s3Client, bucket); err != nil {
+			t.Logf("warn: clear bucket: %v", err)
+		}
+	})
+
+	t.Logf("SSL bucket: %s", bucket)
+
+	db := SetupTestDB(t, "localstack-ssl")
+	if err := db.Create(); err != nil {
+		t.Fatalf("create db: %v", err)
+	}
+	if err := db.Populate("5MB"); err != nil {
+		t.Fatalf("populate db: %v", err)
+	}
+
+	replicaURL := fmt.Sprintf("s3://%s/test-prefix", bucket)
+	db.ReplicaURL = replicaURL
+
+	// Use path-style for SSL
+	configPath := WriteS3AccessPointConfigWithCA(t, db.Path, replicaURL, endpoint, caCertPath, true, "minioadmin", "minioadmin")
+	db.ConfigPath = configPath
+
+	if err := db.StartLitestreamWithConfig(configPath); err != nil {
+		t.Fatalf("start litestream: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.StopLitestream()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := db.GenerateLoad(ctx, 200, 5*time.Second, "steady"); err != nil {
+		t.Fatalf("generate load: %v", err)
+	}
+
+	// Wait for uploaded LTX files to appear in the underlying bucket.
+	defer func() {
+		if t.Failed() {
+			if log, err := db.GetLitestreamLog(); err == nil {
+				t.Logf("Litestream log:\n%s", log)
+			}
+		}
+	}()
+	waitForObjects(t, s3Client, bucket, "test-prefix", 30*time.Second)
+
+	if err := db.StopLitestream(); err != nil {
+		t.Fatalf("stop litestream: %v", err)
+	}
+	db.LitestreamCmd = nil
+
+	restoredPath := filepath.Join(db.TempDir, "restored-ssl.db")
+	if err := db.Restore(restoredPath); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	if err := compareRowCounts(db.Path, restoredPath); err != nil {
+		t.Fatalf("row compare: %v", err)
+	}
 }
