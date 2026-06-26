@@ -2798,8 +2798,8 @@ func (db *DB) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, erro
 	return remoteInfo, nil
 }
 
-// DefaultRestoreParallelism is the default parallelism when downloading WAL files.
-const DefaultRestoreParallelism = 8
+// DefaultRestoreParallelism is the default parallelism when downloading LTX files.
+const DefaultRestoreParallelism = 16
 
 // DefaultFollowInterval is the default polling interval for follow mode.
 const DefaultFollowInterval = 1 * time.Second
@@ -2827,7 +2827,7 @@ type RestoreOptions struct {
 	// If zero, database restore to most recent state available.
 	Timestamp time.Time
 
-	// Specifies how many WAL files are downloaded in parallel during restore.
+	// Specifies how many LTX file chunks are downloaded in parallel during restore.
 	Parallelism int
 
 	// Follow enables continuous restore mode, polling for new LTX files
