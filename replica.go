@@ -687,17 +687,11 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot calc restore plan: %w", err)
 	}
+	if len(infos) == 0 {
+		return fmt.Errorf("no matching backup files available")
+	}
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
-
-	rdrs := make([]io.Reader, 0, len(infos))
-	defer func() {
-		for _, rd := range rdrs {
-			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
-			}
-		}
-	}()
 
 	for _, info := range infos {
 		// Validate file size - must be at least header size to be readable
@@ -706,14 +700,27 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
 		}
 
-		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
+		r.Logger().Debug("planned ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID, "size", info.Size)
 	}
 
-	if len(rdrs) == 0 {
-		return fmt.Errorf("no matching backup files available")
+	parallelism := opt.Parallelism
+	if parallelism < 1 {
+		parallelism = 1
 	}
+
+	downloadStats := newRestoreDownloadPlanStats(infos, restoreDownloadChunkSize)
+	r.Logger().Info("restore download plan",
+		"files", downloadStats.FileCount,
+		"total_size", downloadStats.TotalSize,
+		"min_size", downloadStats.MinSize,
+		"max_size", downloadStats.MaxSize,
+		"avg_size", downloadStats.AvgSize,
+		"download_chunks", downloadStats.DownloadChunks,
+		"level_counts", downloadStats.LevelCounts,
+		"level_sizes", downloadStats.LevelSizes,
+		"parallelism", parallelism,
+		"minTXID", downloadStats.MinTXID,
+		"maxTXID", downloadStats.MaxTXID)
 
 	// Create parent directory if it doesn't exist.
 	var dirInfo os.FileInfo
@@ -723,6 +730,12 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
 		return fmt.Errorf("create parent directory: %w", err)
 	}
+
+	rdrs, err := downloadRestoreFiles(ctx, r.Client, infos, parallelism, restoreDownloadChunkSize, filepath.Dir(opt.OutputPath), r.Logger())
+	if err != nil {
+		return fmt.Errorf("download ltx files: %w", err)
+	}
+	defer func() { closeRestoreReaders(rdrs) }()
 
 	// Output to temp file & atomically rename.
 	tmpOutputPath := opt.OutputPath + ".tmp"
@@ -781,11 +794,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Enter follow mode if enabled, continuously applying new LTX files.
 	if opt.Follow {
-		for _, rd := range rdrs {
-			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
-			}
-		}
+		closeRestoreReaders(rdrs)
 		rdrs = nil
 
 		maxTXID := infos[len(infos)-1].MaxTXID

@@ -927,6 +927,54 @@ func TestReplica_Restore_RemovesTempFileOnFailure(t *testing.T) {
 	}
 }
 
+func TestReplica_Restore_LogsDownloadPlan(t *testing.T) {
+	invalidLTX := bytes.Repeat([]byte{0xff}, ltx.HeaderSize)
+
+	var c mock.ReplicaClient
+	c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+		if level == litestream.SnapshotLevel {
+			return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{
+				Level:     litestream.SnapshotLevel,
+				MinTXID:   1,
+				MaxTXID:   1,
+				Size:      int64(len(invalidLTX)),
+				CreatedAt: time.Now(),
+			}}), nil
+		}
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	}
+	c.OpenLTXFileFunc = func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(invalidLTX)), nil
+	}
+
+	var logBuffer bytes.Buffer
+	db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+	db.Logger = slog.New(slog.NewTextHandler(&logBuffer, nil))
+	r := litestream.NewReplicaWithClient(db, &c)
+
+	err := r.Restore(context.Background(), litestream.RestoreOptions{OutputPath: filepath.Join(t.TempDir(), "restored.db")})
+	if err == nil {
+		t.Fatal("expected restore error")
+	}
+
+	for _, s := range []string{
+		"restore download plan",
+		"files=1",
+		fmt.Sprintf("total_size=%d", len(invalidLTX)),
+		fmt.Sprintf("min_size=%d", len(invalidLTX)),
+		fmt.Sprintf("max_size=%d", len(invalidLTX)),
+		fmt.Sprintf("avg_size=%d", len(invalidLTX)),
+		"download_chunks=1",
+		`level_counts="L9=1"`,
+		fmt.Sprintf(`level_sizes="L9=%d"`, len(invalidLTX)),
+		"parallelism=1",
+	} {
+		if !strings.Contains(logBuffer.String(), s) {
+			t.Fatalf("log output missing %q:\n%s", s, logBuffer.String())
+		}
+	}
+}
+
 func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 	// This test verifies that context cancellation errors are not logged during shutdown.
 	// The fix for issue #235 ensures that context.Canceled and context.DeadlineExceeded

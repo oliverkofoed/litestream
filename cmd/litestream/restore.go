@@ -416,7 +416,7 @@ Arguments:
 	    Defaults to 1s.
 
 	-parallelism NUM
-	    Determines the number of WAL files downloaded in parallel.
+	    Determines the number of LTX file chunks downloaded in parallel.
 	    Defaults to `+strconv.Itoa(litestream.DefaultRestoreParallelism)+`.
 
 	-integrity-check MODE
