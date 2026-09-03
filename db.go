@@ -2828,13 +2828,15 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			return
 		}
 
-		// Build a mapping of changed page numbers and their latest content.
-		maxBytes := pos.walEndOffset - WALHeaderSize
+		// Build a mapping of changed page numbers and their latest content,
+		// bounded to the WAL extent of the advertised position. A transaction
+		// crossing that extent committed after the position, so it is left
+		// out rather than read through to its commit frame (#1490).
 		pageMap := make(map[uint32]int64)
 		var maxOffset int64
 		var walCommit uint32
-		if maxBytes > 0 {
-			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
+		if pos.walEndOffset > WALHeaderSize {
+			pageMap, maxOffset, walCommit, err = rd.pageMapUntil(ctx, pos.walEndOffset)
 			if err != nil {
 				pw.CloseWithError(fmt.Errorf("page map: %w", err))
 				return

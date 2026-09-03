@@ -238,6 +238,58 @@ func (r *WALReader) pageMap(ctx context.Context, maxBytes int64) (m map[uint32]i
 		}
 	}
 
+	m, maxOffset, commit = r.finalizePageMap(ctx, m, commit)
+	return m, maxOffset, commit, limited, nil
+}
+
+// pageMapUntil builds a page map from the transactions that lie entirely at or
+// before endOffset, an absolute WAL file offset. Unlike pageMap, whose byte
+// limit is a soft batch size that always admits the transaction crossing it,
+// this never reads past the bound: a transaction whose commit frame would end
+// after endOffset is left out entirely.
+//
+// The snapshot path uses it with the WAL extent recorded by the L0 file at the
+// current position. An L0 file only ever holds whole transactions, so anything
+// crossing that extent committed after the position and must not appear in a
+// snapshot advertising it. Reading through to its commit frame instead is what
+// tripped the "snapshot wal read exceeded bound" stall (#1490).
+func (r *WALReader) pageMapUntil(ctx context.Context, endOffset int64) (m map[uint32]int64, maxOffset int64, commit uint32, err error) {
+	m = make(map[uint32]int64)
+	txMap := make(map[uint32]int64)
+	data := make([]byte, r.pageSize)
+	frameSize := int64(WALFrameHeaderSize + r.pageSize)
+	for {
+		// Stop before a frame that would extend past the bound.
+		if next := WALHeaderSize + int64(r.frameN)*frameSize; next+frameSize > endOffset {
+			break
+		}
+
+		pgno, fcommit, err := r.ReadFrame(ctx, data)
+		if errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return nil, 0, 0, err
+		}
+
+		// Pages are only promoted to the full map once their txn commits.
+		txMap[pgno] = r.Offset()
+
+		if fcommit != 0 {
+			for pgno, offset := range txMap {
+				m[pgno] = offset
+			}
+			txMap = make(map[uint32]int64)
+			commit = fcommit
+		}
+	}
+
+	m, maxOffset, commit = r.finalizePageMap(ctx, m, commit)
+	return m, maxOffset, commit, nil
+}
+
+// finalizePageMap drops pages beyond the final commit size and computes the
+// WAL offset just past the last frame referenced by the map.
+func (r *WALReader) finalizePageMap(ctx context.Context, m map[uint32]int64, commit uint32) (map[uint32]int64, int64, uint32) {
 	// Remove pages that exceed the final commit size. This can occur when the
 	// database shrinks (e.g., via VACUUM) between transactions in the WAL.
 	for pgno := range m {
@@ -248,7 +300,7 @@ func (r *WALReader) pageMap(ctx context.Context, maxBytes int64) (m map[uint32]i
 
 	// If full transactions available, return the original offset.
 	if len(m) == 0 {
-		return m, 0, 0, limited, nil
+		return m, 0, 0
 	}
 
 	// Compute the highest page offsets.
@@ -263,7 +315,7 @@ func (r *WALReader) pageMap(ctx context.Context, maxBytes int64) (m map[uint32]i
 	end += WALFrameHeaderSize + int64(r.pageSize)
 
 	r.logger.Log(ctx, internal.LevelTrace, "page map complete", "n", len(m), "end", end, "commit", commit)
-	return m, end, commit, limited, nil
+	return m, end, commit
 }
 
 // FrameSaltsUntil returns a set of all unique frame salts in the WAL file.
