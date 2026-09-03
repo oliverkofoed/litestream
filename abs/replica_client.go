@@ -380,15 +380,17 @@ func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, s
 		seek:   seek,
 	}
 
-	// Create paginator for listing blobs with level prefix
+	// Create paginator for listing blobs with level prefix.
+	//
+	// The seek TXID is deliberately NOT appended to the prefix. Doing so only
+	// matches the single blob whose filename starts with exactly that TXID,
+	// but the ReplicaClient contract is "seek or the next available file".
+	// Compaction seeks from the destination level's max TXID + 1, so a
+	// prefix match compacts one file per pass and stalls forever if that
+	// exact file is missing. List the level and filter client-side on
+	// MinTXID below, as the S3 client does. See benbjohnson/litestream#1456.
 	dir := litestream.LTXLevelDir(client.Path, level)
 	prefix := dir + "/"
-
-	// commenting out these lines as they break compaction
-	// from working over time.
-	//if seek != 0 {
-	//	prefix += seek.String()
-	//}
 
 	itr.pager = client.client.NewListBlobsFlatPager(client.Bucket, &azblob.ListBlobsFlatOptions{
 		Prefix:  &prefix,
