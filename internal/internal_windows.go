@@ -21,3 +21,11 @@ func fixRootDirectory(p string) string {
 	}
 	return p
 }
+
+// FsyncDir is a no-op on Windows. Directory handles opened by os.Open() are
+// read-only and FlushFileBuffers requires write access, so File.Sync() on a
+// directory always fails with ERROR_ACCESS_DENIED. NTFS metadata updates such
+// as renames are journaled, so there is no directory sync equivalent to call.
+func FsyncDir(path string) error {
+	return nil
+}
