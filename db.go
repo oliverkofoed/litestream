@@ -1802,6 +1802,10 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 			"salt1", salt1,
 			"salt2", salt2)
 
+		// Keep the extent of the WAL generation being replaced: walContinuedPast
+		// needs it to tell whether that generation ran on past us.
+		prevOffset, oldSalt1, oldSalt2 := info.offset, info.salt1, info.salt2
+
 		info.offset = WALHeaderSize
 		info.salt1, info.salt2 = salt1, salt2
 
@@ -1809,6 +1813,10 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 			return info, fmt.Errorf("detect full checkpoint: %w", err)
 		} else if detected {
 			info.reason = "full or restart checkpoint detected, snapshotting"
+		} else if continued, err := db.walContinuedPast(prevOffset, oldSalt1, oldSalt2); err != nil {
+			return info, fmt.Errorf("check for unsynced wal tail: %w", err)
+		} else if continued {
+			info.reason = "wal restarted past the last synced offset, snapshotting"
 		} else {
 			info.snapshotting = false
 		}
@@ -1819,6 +1827,35 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	info.snapshotting = false
 
 	return info, nil
+}
+
+// walContinuedPast reports whether the WAL generation that has just been
+// replaced still holds a frame at offset. A frame's salt identifies its
+// generation, so one carrying salt1/salt2 at the offset we had synced to means
+// that generation ran on past us, and the frames beyond it were checkpointed
+// into the database and discarded before we read them. Resuming incrementally
+// would drop those page writes from the replica for good, so the caller must
+// snapshot instead.
+//
+// Restarting a WAL does not shorten the file, so the evidence usually survives.
+// It does not survive a truncation, nor a new generation that has already
+// written past offset; both report false, which leaves the existing behaviour
+// unchanged rather than proving the reset was safe.
+func (db *DB) walContinuedPast(offset int64, salt1, salt2 uint32) (bool, error) {
+	if db.pageSize <= 0 || offset < WALHeaderSize {
+		return false, nil
+	}
+
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
+	frame, err := readWALFileAt(db.WALPath(), offset, frameSize)
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false, nil // the WAL stops here, so nothing ran past us
+	} else if err != nil {
+		return false, fmt.Errorf("read wal frame at %d: %w", offset, err)
+	}
+
+	return binary.BigEndian.Uint32(frame[8:]) == salt1 &&
+		binary.BigEndian.Uint32(frame[12:]) == salt2, nil
 }
 
 // lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
